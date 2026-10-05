@@ -1,0 +1,209 @@
+##########################################################################################
+#                                                                                        #
+# OpenSpace                                                                              #
+#                                                                                        #
+# Copyright (c) 2014-2026                                                                #
+#                                                                                        #
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this   #
+# software and associated documentation files (the "Software"), to deal in the Software  #
+# without restriction, including without limitation the rights to use, copy, modify,     #
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to     #
+# permit persons to whom the Software is furnished to do so, subject to the following    #
+# conditions:                                                                            #
+#                                                                                        #
+# The above copyright notice and this permission notice shall be included in all copies  #
+# or substantial portions of the Software.                                               #
+#                                                                                        #
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,    #
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A          #
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT     #
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF   #
+# CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE   #
+# OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                          #
+##########################################################################################
+
+include(${PROJECT_SOURCE_DIR}/support/cmake/message_macros.cmake)
+include(${PROJECT_SOURCE_DIR}/support/cmake/application_definition.cmake)
+
+# We are getting all_enabled_modules from the handle_applications.cmake file which gets
+# it from the main CMakeLists file
+
+#####
+# Spout
+#####
+if (SGCT_SPOUT_SUPPORT AND NOT OPENSPACE_MODULE_SPOUT)
+  message(WARNING "Spout support from SGCT was requested, but OpenSpace Spout module was disabled")
+  message(STATUS "Enabling module as dependency")
+  set(OPENSPACE_MODULE_SPOUT ON CACHE BOOL "Build OPENSPACE_MODULE_SPOUTModule" FORCE)
+endif ()
+
+#####
+# MacOS
+#####
+if (APPLE)
+  set(MACOSX_BUNDLE_ICON_FILE openspace.icns)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum OS X deployment version" FORCE)
+  set(CMAKE_XCODE_ATTRIBUTE_OTHER_CODE_SIGN_FLAGS "--deep" CACHE STRING "Other Code Signing Flags" FORCE)
+endif ()
+
+create_new_application(OpenSpace
+  ${SGCT_OPENVR_FILES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/openspace.rc
+  ${CMAKE_CURRENT_SOURCE_DIR}/openspace.icns
+)
+
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/openspace.icns PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+
+target_include_directories(
+  OpenSpace PRIVATE
+  ${OPENVR_INCLUDE_DIRS}
+  ${SGCT_OPENVR_INCLUDE_DIRECTORY}
+  ${SPOUT_INCLUDE_DIRS}
+)
+
+target_link_libraries(OpenSpace PRIVATE openspace-core openspace-module-collection ${OPENVR_LIBRARY} ${SPOUT_LIBRARY})
+
+target_compile_definitions(OpenSpace PRIVATE
+  ${SGCT_OPENVR_DEFINITIONS}
+  ${SPOUT_DEFINITIONS}
+)
+
+if (OPENSPACE_BREAK_ON_FLOATING_POINT_EXCEPTION)
+  target_compile_definitions(OpenSpace PRIVATE "OPENSPACE_BREAK_ON_FLOATING_POINT_EXCEPTION")
+endif ()
+
+if (UNIX)
+  # The packages ship the Qt libraries in the same folder as the executable (see
+  # support/cmake/packaging.cmake), which the loader only finds through this RPATH. The
+  # build tree keeps the default RPATH pointing at the vcpkg libraries, so running from
+  # bin/ during development is unaffected
+  set_target_properties(OpenSpace PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif ()
+
+begin_header("Dependency: SGCT")
+
+# SGCT is resolved through the vcpkg overlay port at support/vcpkg/ports/sgct, which
+# fetches a pinned commit of https://github.com/SGCT/SGCT from GitHub. To move to a newer
+# SGCT, update REF and SHA512 in that port's portfile.cmake
+find_package(sgct CONFIG REQUIRED)
+target_link_libraries(OpenSpace PRIVATE sgct::sgct)
+
+if (UNIX AND NOT APPLE)
+  target_link_libraries(OpenSpace PRIVATE Xcursor Xinerama X11)
+endif ()
+
+# The sgct port installs sgct.schema.json next to its CMake config, which is what
+# ${sgct_DIR} points at
+add_custom_command(TARGET OpenSpace POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  ${sgct_DIR}/sgct.schema.json
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../config/schema/sgct.schema.json
+  COMMAND_EXPAND_LISTS
+)
+
+# The calibrator is a standalone SGCT tool that is not linked against, so it only has to
+# end up next to the OpenSpace binary. The paths come from the top-level CMakeLists
+if (EXISTS "${OPENSPACE_SGCT_CALIBRATOR}")
+  add_custom_command(TARGET OpenSpace POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${OPENSPACE_SGCT_CALIBRATOR}"
+    ${OPENSPACE_SGCT_CALIBRATOR_PATTERNS}
+    $<TARGET_FILE_DIR:OpenSpace>
+    COMMAND_EXPAND_LISTS
+  )
+endif ()
+
+end_header("Dependency: SGCT")
+
+# Profile Editor / Launcher GUI
+option(OPENSPACE_APPLICATION_OPENSPACE-LAUNCHER "Build Launcher GUI" ON)
+if (OPENSPACE_APPLICATION_OPENSPACE-LAUNCHER)
+  begin_header("Dependency: Profile Editor")
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/ext/launcher)
+  target_link_libraries(OpenSpace PRIVATE openspace-ui-launcher)
+  target_compile_definitions(OpenSpace PRIVATE OPENSPACE_HAS_LAUNCHER)
+  end_header("Dependency: Profile Editor")
+
+  if (WIN32 AND OPENSPACE_USE_SYSTEM_QT)
+    # A system Qt keeps its runtime plugins (platforms/qwindows.dll, styles, imageformats,
+    # tls, ...) inside its own installation, and they are loaded by name at runtime rather
+    # than being link dependencies of OpenSpace. windeployqt is the only thing that knows
+    # where that installation put them, so it places them next to the executable.
+    find_program(OPENSPACE_WINDEPLOYQT_EXECUTABLE
+      NAMES windeployqt
+      HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}"
+      NO_DEFAULT_PATH
+      REQUIRED
+    )
+
+    add_custom_command(
+      TARGET OpenSpace POST_BUILD
+      COMMAND ${OPENSPACE_WINDEPLOYQT_EXECUTABLE}
+        --no-translations
+        --no-compiler-runtime
+        --verbose=0
+        "$<TARGET_FILE:OpenSpace>"
+      COMMENT "Deploying Qt runtime dependencies via windeployqt"
+      VERBATIM
+    )
+  endif ()
+
+  # Qt is linked dynamically (LGPL compliance), whether it comes from vcpkg or, with
+  # OPENSPACE_USE_SYSTEM_QT, from the system. The Qt libraries themselves are picked up by
+  # the $<TARGET_RUNTIME_DLLS:OpenSpace> copy further down on Windows and are found
+  # through the RPATH on Linux, but the runtime plugins (platforms/qwindows.dll, styles,
+  # imageformats, tls, ...) are loaded by name at runtime and are not link dependencies,
+  # so they have to be copied next to the executable, where Qt's default plugin search
+  # path picks them up
+  if (NOT OPENSPACE_USE_SYSTEM_QT)
+    add_custom_command(
+      TARGET OpenSpace POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+        "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/$<IF:$<CONFIG:Debug>,debug/,>Qt6/plugins"
+        "$<TARGET_FILE_DIR:OpenSpace>"
+      COMMENT "Deploying Qt runtime plugins"
+      VERBATIM
+    )
+  endif ()
+endif ()
+
+# Web Browser and Web gui
+# Why not put these in the module's path? Because they do not have access to the
+# target as of July 2017, which is needed
+if (OPENSPACE_MODULE_WEBBROWSER AND CEF_ROOT)
+  # wanted by CEF
+  set(PROJECT_ARCH "x86_64")
+
+  if (WIN32)
+    set(RESOURCE_FILE openspace.rc)
+  endif ()
+
+  # Add the CEF binary distribution's cmake/ directory to the module path and
+  # find CEF to initialize it properly.
+  set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${WEBBROWSER_MODULE_PATH}/cmake")
+  include(webbrowser_helpers)
+
+  set_cef_targets("${CEF_ROOT}" OpenSpace)
+  run_cef_platform_config("${CEF_ROOT}" "${CEF_TARGET}" "${WEBBROWSER_MODULE_PATH}")
+else ()
+  message(WARNING "Web configured to be included, but no CEF_ROOT was found, please try configuring CMake again")
+endif ()
+
+if (MSVC)
+  begin_header("Dependency: Dbghelp")
+  # This library is used for being able to output the callstack if an exception escapes
+  target_link_libraries(OpenSpace PRIVATE Dbghelp.lib)
+  end_header()
+endif ()
+
+if (OPENSPACE_NVTOOLS_ENABLED)
+  target_link_libraries(OpenSpace PRIVATE "${OPENSPACE_NVTOOLS_PATH}/lib/x64/nvToolsExt64_1.lib")
+endif ()
+
+if (WIN32)
+  add_custom_command(TARGET OpenSpace POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:OpenSpace> $<TARGET_FILE_DIR:OpenSpace>
+    COMMAND_EXPAND_LISTS
+  )
+endif ()

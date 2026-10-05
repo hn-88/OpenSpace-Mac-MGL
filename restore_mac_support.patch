@@ -1,0 +1,1351 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0da0db26bd..268a7d9f9e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,6 +158,23 @@ set_target_properties(codegen-tool PROPERTIES FOLDER "support")
+ set_target_properties(run_codegen PROPERTIES FOLDER "support")
+ 
+ 
++# Qt
++# Unfortunately, we have to set this value manually; sigh
++# In the future, if the Qt version is updated, just add to this variable ---abock
++if (APPLE)
++  set(CMAKE_PREFIX_PATH
++    "~/Qt/5.6/clang_64/lib/cmake"
++    "~/Qt/5.7/clang_64/lib/cmake"
++    "~/Qt/5.8/clang_64/lib/cmake"
++    "~/Qt/5.9/clang_64/lib/cmake"
++    "~/Qt/5.10/clang_64/lib/cmake"
++    "~/Qt/5.11/clang_64/lib/cmake"
++    "~/Qt/5.12/clang_64/lib/cmake"
++    "~/Qt/5.15.1/clang_64/lib/cmake"
++    "~/Qt/6.2.3/macos/lib/cmake"
++  )
++endif ()
++
+ begin_header("Configuring Modules")
+ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/modules")
+ end_header("End: Configuring Modules")
+diff --git a/apps/OpenSpace/CMakeLists.txt b/apps/OpenSpace/CMakeLists.txt
+index 8c49998033..275ee8b16b 100644
+--- a/apps/OpenSpace/CMakeLists.txt
++++ b/apps/OpenSpace/CMakeLists.txt
+@@ -72,6 +72,15 @@ if (SGCT_SPOUT_SUPPORT AND NOT OPENSPACE_MODULE_SPOUT)
+ endif ()
+ 
+ 
++#####
++# MacOS
++#####
++if (APPLE)
++  set(MACOSX_BUNDLE_ICON_FILE openspace.icns)
++  set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum OS X deployment version" FORCE)
++  set(CMAKE_XCODE_ATTRIBUTE_OTHER_CODE_SIGN_FLAGS "--deep" CACHE STRING "Other Code Signing Flags" FORCE)
++endif ()
++
+ create_new_application(OpenSpace
+   ${SGCT_OPENVR_FILES}
+   ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+@@ -121,7 +130,7 @@ if (TARGET SGCTTest)
+   set_target_properties(SGCTTest PROPERTIES FOLDER "External")
+ endif ()
+ 
+-if (UNIX)
++if (UNIX AND (NOT APPLE))
+   target_link_libraries(OpenSpace PRIVATE Xcursor Xinerama X11)
+ endif ()
+ 
+diff --git a/apps/OpenSpace/main.cpp b/apps/OpenSpace/main.cpp
+index 2c66c7893d..7d2d91e244 100644
+--- a/apps/OpenSpace/main.cpp
++++ b/apps/OpenSpace/main.cpp
+@@ -22,6 +22,12 @@
+  * OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                         *
+  ****************************************************************************************/
+ 
++// Explicitly including OpenGL for APPLE
++#ifdef __APPLE__
++#define GLFW_INCLUDE_NONE
++#include <OpenGL/gl3.h>
++#endif // __APPLE__
++
+ #include <openspace/documentation/documentation.h>
+ #include <openspace/engine/configuration.h>
+ #include <openspace/engine/globals.h>
+@@ -329,6 +335,8 @@ void mainInitFunc(GLFWwindow*) {
+     global::openSpaceEngine->initialize();
+     LDEBUG("Initializing OpenSpace Engine finished");
+ 
++#ifndef __APPLE__
++    // Apparently: "Cocoa: Regular windows do not have icons on macOS"
+     {
+         const std::filesystem::path path = absPath("${DATA}/openspace-icon.png");
+         int x = 0;
+@@ -348,6 +356,7 @@ void mainInitFunc(GLFWwindow*) {
+ 
+         stbi_image_free(icon.pixels);
+     }
++#endif // __APPLE__
+ 
+     currentWindow = Engine::instance().windows().front().get();
+     currentViewport = currentWindow->viewports().front().get();
+@@ -1439,10 +1448,22 @@ int main(int argc, char* argv[]) {
+ 
+     global::openSpaceEngine->createUserDirectoriesIfNecessary();
+ 
++    // (abock, 2020-12-07)  For some reason on Apple the keyboard handler in CEF will call
++    // the Qt one even if the QApplication was destroyed, leading to invalid memory
++    // access.  The only way we could fix this for the release was to keep the
++    // QApplication object around until the end of the program.  Even though the Qt
++    // keyboard handler gets called, it doesn't do anything so everything still works.
++#ifdef __APPLE__
++    int qac = 0;
++    QApplication app(qac, nullptr);
++#endif // __APPLE__
++
+     if (!global::configuration->bypassLauncher) {
+ #ifdef OPENSPACE_HAS_LAUNCHER
++#ifndef __APPLE__
+         int qac = 0;
+         QApplication app(qac, nullptr);
++#endif // __APPLE__
+ 
+         std::string pwd = std::filesystem::current_path().string();
+         if (const size_t it = pwd.find_first_of("'\"[]");  it != std::string::npos) {
+@@ -1593,6 +1614,10 @@ int main(int argc, char* argv[]) {
+     Log::instance().setShowLogLevel(false);
+     Log::instance().setLogCallback(mainLogCallback);
+ 
++#ifdef __APPLE__
++    glfwWindowHint(GLFW_STENCIL_BITS, 8);
++#endif
++
+     std::filesystem::path winConf =
+         commandlineArguments.windowConfig.has_value() ?
+         *commandlineArguments.windowConfig :
+@@ -1659,6 +1684,30 @@ int main(int argc, char* argv[]) {
+         throw;
+     }
+ 
++#ifdef __APPLE__
++    // Workaround for OpenGL bug that Apple introduced in 10.14 Mojave that prevents an
++    // OpenGL context to display anything until it is first moved or resized in dark
++    // mode. So we are going through all windows here and resize them a bit larger and
++    // then back to the desired resolution. Resizing the window to the same size doesn't
++    // work as GLFW probably has a check for setting the current values.
++    // This can be removed once the OpenGL bug is fixed.
++    // In order to check, comment out the following lines and start OpenSpace on a 10.14
++    // machine. If the loading screen shows up without doing anything to the window, it
++    // is fixed. With the bug, the rendering stays gray even well after the main render
++    // loop has started     -- 2018-10-28   abock
++    for (const std::unique_ptr<Window>& window : Engine::instance().windows()) {
++        GLFWwindow* w = window->windowHandle();
++        int x, y;
++        glfwGetWindowPos(w, &x, &y);
++        glfwSetWindowPos(w, x + 1, y + 1);
++        glfwSwapBuffers(w);
++        glfwPollEvents();
++        glfwSetWindowPos(w, x, y);
++        glfwSwapBuffers(w);
++        glfwPollEvents();
++    }
++#endif // __APPLE__
++
+     LINFO("Starting rendering loop");
+     Engine::instance().exec();
+     LINFO("Ending rendering loop");
+diff --git a/ext/CMakeLists.txt b/ext/CMakeLists.txt
+index 6561633c5c..dd745db73d 100644
+--- a/ext/CMakeLists.txt
++++ b/ext/CMakeLists.txt
+@@ -22,6 +22,28 @@
+ # OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                          #
+ ##########################################################################################
+ 
++# System libraries
++if (APPLE)
++  begin_dependency("Core Libraries")
++  add_library(external-system-apple INTERFACE)
++
++  target_include_directories(external-system-apple INTERFACE "/Developer/Headers/FlatCarbon")
++  find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
++  find_library(CARBON_LIBRARY Carbon REQUIRED)
++  find_library(COCOA_LIBRARY Cocoa REQUIRED) # This was Carbon before
++  find_library(APP_SERVICES_LIBRARY ApplicationServices REQUIRED)
++  find_library(APPKIT_LIBRARY AppKit REQUIRED)
++  mark_as_advanced(COREFOUNDATION_LIBRARY CARBON_LIBRARY COCOA_LIBRARY
++    APP_SERVICES_LIBRARY APPKIT_LIBRARY
++  )
++  target_link_libraries(external-system-apple INTERFACE # This was PUBLIC before
++    ${CARBON_LIBRARY} ${COREFOUNDATION_LIBRARY}
++    ${COCOA_LIBRARY} ${APP_SERVICES_LIBRARY}
++    ${APPKIT_LIBRARY}
++  )
++  end_dependency()
++endif ()
++
+ # Ghoul
+ if (NOT OPENSPACE_HAVE_TESTS)
+   # Unless overriden, disable ghoul tests if OpenSpace tests are disabled
+diff --git a/include/openspace/interaction/touchbar.h b/include/openspace/interaction/touchbar.h
+new file mode 100644
+index 0000000000..73c5daa1b3
+--- /dev/null
++++ b/include/openspace/interaction/touchbar.h
+@@ -0,0 +1,36 @@
++/*****************************************************************************************
++ *                                                                                       *
++ * OpenSpace                                                                             *
++ *                                                                                       *
++ * Copyright (c) 2014-2026                                                               *
++ *                                                                                       *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this  *
++ * software and associated documentation files (the "Software"), to deal in the Software *
++ * without restriction, including without limitation the rights to use, copy, modify,    *
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    *
++ * permit persons to whom the Software is furnished to do so, subject to the following   *
++ * conditions:                                                                           *
++ *                                                                                       *
++ * The above copyright notice and this permission notice shall be included in all copies *
++ * or substantial portions of the Software.                                              *
++ *                                                                                       *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   *
++ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         *
++ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    *
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF  *
++ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE  *
++ * OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                         *
++ ****************************************************************************************/
++
++#ifndef __OPENSPACE_CORE___TOUCHBAR___H__
++#define __OPENSPACE_CORE___TOUCHBAR___H__
++
++namespace openspace {
++
++// Initializes the touch bar on MacOS (if available) and creates all the buttons and
++// callbacks
++void showTouchbar();
++
++} // namespace openspace
++
++#endif // __OPENSPACE_CORE___TOUCHBAR___H__
+diff --git a/modules/audio/CMakeLists.txt b/modules/audio/CMakeLists.txt
+index 24ee7798af..7ec100055c 100644
+--- a/modules/audio/CMakeLists.txt
++++ b/modules/audio/CMakeLists.txt
+@@ -46,8 +46,10 @@ begin_dependency("SoLoud")
+ set(SOLOUD_BACKEND_SDL2 OFF CACHE BOOL "")
+ if (WIN32)
+   set(SOLOUD_BACKEND_WINMM ON CACHE BOOL "")
+-elseif (UNIX)
++elseif (UNIX AND NOT APPLE)
+   set(SOLOUD_BACKEND_ALSA ON CACHE BOOL "")
++elseif (APPLE)
++  set(SOLOUD_BACKEND_COREAUDIO ON CACHE BOOL "")
+ endif ()
+ add_subdirectory(ext/soloud/contrib SYSTEM)
+ 
+diff --git a/modules/base/rendering/grids/renderableboxgrid.cpp b/modules/base/rendering/grids/renderableboxgrid.cpp
+index 1f9cce9b6a..6725c47c77 100644
+--- a/modules/base/rendering/grids/renderableboxgrid.cpp
++++ b/modules/base/rendering/grids/renderableboxgrid.cpp
+@@ -155,7 +155,11 @@ void RenderableBoxGrid::render(const RenderData& data, RendererTasks&) {
+     _gridProgram->setUniform("gridColor", _color);
+ 
+     // Change GL state:
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnablei(GL_BLEND, 0);
+     glEnable(GL_LINE_SMOOTH);
+diff --git a/modules/base/rendering/grids/renderablegrid.cpp b/modules/base/rendering/grids/renderablegrid.cpp
+index 4f0801222f..13acbf8302 100644
+--- a/modules/base/rendering/grids/renderablegrid.cpp
++++ b/modules/base/rendering/grids/renderablegrid.cpp
+@@ -270,7 +270,11 @@ void RenderableGrid::render(const RenderData& data, RendererTasks&) {
+     _gridProgram->setUniform("gridColor", _color);
+ 
+     // Change GL state:
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+     glEnablei(GL_BLEND, 0);
+     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnable(GL_LINE_SMOOTH);
+@@ -281,7 +285,11 @@ void RenderableGrid::render(const RenderData& data, RendererTasks&) {
+     glDrawArrays(_mode, 0, static_cast<GLsizei>(_varray.size()));
+ 
+     // Render major grid
++#ifndef __APPLE__
+     glLineWidth(_highlightLineWidth);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+     _gridProgram->setUniform("gridColor", _highlightColor);
+ 
+     glBindVertexArray(_highlightVao);
+diff --git a/modules/base/rendering/grids/renderableradialgrid.cpp b/modules/base/rendering/grids/renderableradialgrid.cpp
+index a3a368d475..c37daa62e3 100644
+--- a/modules/base/rendering/grids/renderableradialgrid.cpp
++++ b/modules/base/rendering/grids/renderableradialgrid.cpp
+@@ -210,7 +210,11 @@ void RenderableRadialGrid::render(const RenderData& data, RendererTasks&) {
+     _gridProgram->setUniform("gridColor", _color);
+ 
+     // Change GL state:
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else
++    glLineWidth(1.f);
++#endif
+     glEnablei(GL_BLEND, 0);
+     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnable(GL_LINE_SMOOTH);
+diff --git a/modules/base/rendering/grids/renderablesphericalgrid.cpp b/modules/base/rendering/grids/renderablesphericalgrid.cpp
+index f1d813ec07..b1059c11a0 100644
+--- a/modules/base/rendering/grids/renderablesphericalgrid.cpp
++++ b/modules/base/rendering/grids/renderablesphericalgrid.cpp
+@@ -219,7 +219,12 @@ void RenderableSphericalGrid::render(const RenderData& data, RendererTasks&) {
+     _gridProgram->setUniform("gridColor", _color);
+ 
+     // Change GL state:
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else // ^^^^ !__APPLE__ // __APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
++
+     glEnablei(GL_BLEND, 0);
+     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnable(GL_LINE_SMOOTH);
+diff --git a/modules/base/rendering/renderablecartesianaxes.cpp b/modules/base/rendering/renderablecartesianaxes.cpp
+index ed32b5c571..3255e0f4ba 100644
+--- a/modules/base/rendering/renderablecartesianaxes.cpp
++++ b/modules/base/rendering/renderablecartesianaxes.cpp
+@@ -189,7 +189,11 @@ void RenderableCartesianAxes::render(const RenderData& data, RendererTasks&) {
+     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     glEnablei(GL_BLEND, 0);
+     glEnable(GL_LINE_SMOOTH);
++#ifndef __APPLE__
+     glLineWidth(3.f);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+ 
+     glBindVertexArray(_vao);
+     glDrawElements(GL_LINES, 6, GL_UNSIGNED_INT, nullptr);
+diff --git a/modules/base/rendering/renderabletrail.cpp b/modules/base/rendering/renderabletrail.cpp
+index 3c565bee63..59e57109c0 100644
+--- a/modules/base/rendering/renderabletrail.cpp
++++ b/modules/base/rendering/renderabletrail.cpp
+@@ -44,12 +44,21 @@
+ #include <optional>
+ 
+ namespace {
++#ifdef __APPLE__
++    constexpr std::array<const char*, 16> UniformNames = {
++        "opacity", "modelViewTransform", "projectionTransform", "color", "useLineFade",
++        "lineLength", "lineFadeAmount", "vertexSortingMethod", "idOffset", "nVertices",
++        "stride", "pointSize", "renderPhase", "useSplitRenderMode", "floatingOffset",
++        "numberOfUniqueVertices"
++    };
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
+     constexpr std::array<const char*, 18> UniformNames = {
+         "opacity", "modelViewTransform", "projectionTransform", "color", "useLineFade",
+         "lineLength", "lineFadeAmount", "vertexSortingMethod", "idOffset", "nVertices",
+         "stride", "pointSize", "renderPhase", "viewport", "lineWidth", "floatingOffset",
+         "useSplitRenderMode", "numberOfUniqueVertices"
+     };
++#endif // __APPLE__
+ 
+     // The possible values for the _renderingModes property
+     enum RenderingMode {
+@@ -250,6 +259,18 @@ void RenderableTrail::initialize() {
+ void RenderableTrail::initializeGL() {
+     ZoneScoped;
+ 
++#ifdef __APPLE__
++    _programObject = BaseModule::ProgramObjectManager.request(
++        "EphemerisProgram",
++        []() -> std::unique_ptr<ghoul::opengl::ProgramObject> {
++            return global::renderEngine->buildRenderProgram(
++                "EphemerisProgram",
++                absPath("${MODULE_BASE}/shaders/renderabletrail_apple_vs.glsl"),
++                absPath("${MODULE_BASE}/shaders/renderabletrail_apple_fs.glsl")
++            );
++        }
++    );
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
+     _programObject = BaseModule::ProgramObjectManager.request(
+         "EphemerisProgram",
+         []() -> std::unique_ptr<ghoul::opengl::ProgramObject> {
+@@ -260,6 +281,7 @@ void RenderableTrail::initializeGL() {
+             );
+         }
+     );
++#endif // __APPLE__
+ 
+     ghoul::opengl::updateUniformLocations(*_programObject, _uniformCache, UniformNames);
+ }
+@@ -331,6 +353,7 @@ void RenderableTrail::internalRender(bool renderLines, bool renderPoints,
+     _programObject->setUniform(_uniformCache.numberOfUniqueVertices,
+         numberOfUniqueVertices);
+ 
++#ifndef __APPLE__
+     std::array<GLint, 4> viewport;
+     global::renderEngine->openglStateCache().viewport(viewport.data());
+     _programObject->setUniform(
+@@ -344,6 +367,7 @@ void RenderableTrail::internalRender(bool renderLines, bool renderPoints,
+         _uniformCache.lineWidth,
+         std::ceil((2.f * 1.f + _appearance.lineWidth) * std::sqrt(2.f))
+     );
++#endif // __APPLE__
+ 
+     if (renderPoints) {
+         // The stride parameter determines the distance between larger points and
+@@ -436,7 +460,11 @@ void RenderableTrail::render(const RenderData& data, RendererTasks&) {
+                               (_appearance.renderingModes == RenderingModeLinesPoints);
+ 
+     if (renderLines) {
++#ifdef __APPLE__
++        glLineWidth(1);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
+         glLineWidth(std::ceil((2.f * 1.f + _appearance.lineWidth) * std::sqrt(2.f)));
++#endif // __APPLE__
+     }
+     if (renderPoints) {
+         glEnable(GL_PROGRAM_POINT_SIZE);
+diff --git a/modules/base/rendering/renderabletrail.h b/modules/base/rendering/renderabletrail.h
+index 3567f33811..caded421c0 100644
+--- a/modules/base/rendering/renderabletrail.h
++++ b/modules/base/rendering/renderabletrail.h
+@@ -193,11 +193,18 @@ private:
+ 
+     /// Program object used to render the data stored in RenderInformation
+     ghoul::opengl::ProgramObject* _programObject = nullptr;
++#ifdef __APPLE__
++    UniformCache(opacity, modelViewTransform, projectionTransform, color, useLineFade,
++        lineLength, lineFadeAmount, vertexSortingMethod, idOffset, nVertices, stride,
++        pointSize, renderPhase, useSplitRenderMode, floatingOffset, numberOfUniqueVertices
++    ) _uniformCache;
++#else
+     UniformCache(opacity, modelViewTransform, projectionTransform, color, useLineFade,
+         lineLength, lineFadeAmount, vertexSortingMethod, idOffset, nVertices, stride,
+         pointSize, renderPhase, viewport, lineWidth, floatingOffset, useSplitRenderMode,
+         numberOfUniqueVertices
+     ) _uniformCache;
++#endif
+ };
+ 
+ } // namespace openspace
+diff --git a/modules/base/shaders/renderabletrail_apple_fs.glsl b/modules/base/shaders/renderabletrail_apple_fs.glsl
+new file mode 100644
+index 0000000000..002e120fa0
+--- /dev/null
++++ b/modules/base/shaders/renderabletrail_apple_fs.glsl
+@@ -0,0 +1,62 @@
++/*****************************************************************************************
++ *                                                                                       *
++ * OpenSpace                                                                             *
++ *                                                                                       *
++ * Copyright (c) 2014-2026                                                               *
++ *                                                                                       *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this  *
++ * software and associated documentation files (the "Software"), to deal in the Software *
++ * without restriction, including without limitation the rights to use, copy, modify,    *
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    *
++ * permit persons to whom the Software is furnished to do so, subject to the following   *
++ * conditions:                                                                           *
++ *                                                                                       *
++ * The above copyright notice and this permission notice shall be included in all copies *
++ * or substantial portions of the Software.                                              *
++ *                                                                                       *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   *
++ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         *
++ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    *
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF  *
++ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE  *
++ * OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                         *
++ ****************************************************************************************/
++
++#include "fragment.glsl"
++
++in Data {
++  vec4 gPosition;
++  float positionDepth;
++  in float fade;
++} in_data;
++
++uniform vec3 color;
++uniform int renderPhase;
++uniform float opacity = 1.0;
++
++// Fragile! Keep in sync with RenderableTrail::render::RenderPhase
++const int RenderPhaseLines = 0;
++const int RenderPhasePoints  = 1;
++
++const float Delta = 0.25;
++
++
++Fragment getFragment() {
++  Fragment frag;
++  frag.color = vec4(color * in_data.fade, in_data.fade * opacity);
++  frag.depth = in_data.positionDepth;
++  frag.blend = BlendModeAdditive;
++
++  if (renderPhase == RenderPhasePoints) {
++    // Use the length of the vector (dot(circCoord, circCoord)) as factor in the
++    // smoothstep to gradually decrease the alpha on the edges of the point
++    vec2 circCoord = 2.0 * gl_PointCoord - 1.0;
++    //float circleClipping = 1.0 - smoothstep(1.0 - Delta, 1.0, dot(circCoord, circCoord));
++    float circleClipping = smoothstep(1.0, 1.0 - Delta, dot(circCoord, circCoord));
++    frag.color.a *= circleClipping;
++  }
++
++  frag.gPosition = in_data.gPosition;
++  frag.gNormal = vec4(0.0, 0.0, -1.0, 1.0); // There is no normal here
++  return frag;
++}
+diff --git a/modules/base/shaders/renderabletrail_apple_vs.glsl b/modules/base/shaders/renderabletrail_apple_vs.glsl
+new file mode 100644
+index 0000000000..4a04a22ed4
+--- /dev/null
++++ b/modules/base/shaders/renderabletrail_apple_vs.glsl
+@@ -0,0 +1,112 @@
++/*****************************************************************************************
++ *                                                                                       *
++ * OpenSpace                                                                             *
++ *                                                                                       *
++ * Copyright (c) 2014-2026                                                               *
++ *                                                                                       *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this  *
++ * software and associated documentation files (the "Software"), to deal in the Software *
++ * without restriction, including without limitation the rights to use, copy, modify,    *
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    *
++ * permit persons to whom the Software is furnished to do so, subject to the following   *
++ * conditions:                                                                           *
++ *                                                                                       *
++ * The above copyright notice and this permission notice shall be included in all copies *
++ * or substantial portions of the Software.                                              *
++ *                                                                                       *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   *
++ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         *
++ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    *
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF  *
++ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE  *
++ * OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                         *
++ ****************************************************************************************/
++
++#version __CONTEXT__
++
++#include "powerscaling/powerscaling_vs.glsl"
++
++layout(location = 0) in vec3 in_pointPosition;
++
++out Data {
++  vec4 gPosition;
++  float positionDepth;
++  float fade;
++} out_data;
++
++uniform dmat4 modelViewTransform;
++uniform mat4 projectionTransform;
++uniform int idOffset;
++uniform int nVertices;
++uniform bool useLineFade;
++uniform float lineLength;
++uniform float lineFadeAmount;
++uniform int vertexSortingMethod;
++uniform int pointSize;
++uniform int stride;
++
++uniform ivec2 resolution;
++
++uniform bool useSplitRenderMode;
++uniform int numberOfUniqueVertices;
++uniform int floatingOffset;
++
++// Fragile! Keep in sync with RenderableTrail::render
++const int VertexSortingNewestFirst = 0;
++const int VertexSortingOldestFirst = 1;
++const int VertexSortingNoSorting = 2;
++
++
++void main() {
++  int modId = gl_VertexID;
++
++  if ((vertexSortingMethod != VertexSortingNoSorting) && useLineFade) {
++    float id = 0;
++
++    if (useSplitRenderMode) {
++        // Calculates id for when using split render mode (renderableTrailTrajectory)
++        id = float(floatingOffset + modId) / float(max(1, numberOfUniqueVertices - 1));
++    }
++    else {
++        // Account for a potential rolling buffer
++        modId = gl_VertexID - idOffset;
++        if (modId < 0) {
++          modId += nVertices;
++        }
++
++        // Convert the index to a [0,1] range
++        id = float(modId) / float(nVertices);
++    }
++
++    if (vertexSortingMethod == VertexSortingNewestFirst) {
++      id = 1.0 - id;
++    }
++
++    float b0 = lineLength;
++    float b1 = lineFadeAmount;
++
++    float fadeValue = 0.0;
++    if (id <= b0) {
++      fadeValue = 0.0;
++    }
++    else if (id > b0 && id < b1) {
++      fadeValue = (id - b0) / (b1 - b0);
++    }
++    else {
++      fadeValue = 1.0;
++    }
++
++    out_data.fade = clamp(fadeValue, 0.0, 1.0);
++  }
++  else {
++    out_data.fade = 1.0;
++  }
++
++  out_data.gPosition = vec4(modelViewTransform * dvec4(in_pointPosition, 1.0));
++  vec4 positionClipSpace = projectionTransform * out_data.gPosition;
++  out_data.positionDepth = positionClipSpace.w;
++
++  float pts = float(pointSize);
++  gl_PointSize = (stride == 1 || int(modId) % stride == 0) ? pts : pts / 2.0;
++  gl_Position = z_normalization(positionClipSpace);
++}
+diff --git a/modules/fieldlinessequence/rendering/renderablefieldlinessequence.cpp b/modules/fieldlinessequence/rendering/renderablefieldlinessequence.cpp
+index 3d7688456c..fb1ebdacc6 100644
+--- a/modules/fieldlinessequence/rendering/renderablefieldlinessequence.cpp
++++ b/modules/fieldlinessequence/rendering/renderablefieldlinessequence.cpp
+@@ -1295,7 +1295,11 @@ void RenderableFieldlinesSequence::render(const RenderData& data, RendererTasks&
+     }
+ 
+     glBindVertexArray(_vao);
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else
++    glLineWidth(1.f);
++#endif
+ 
+     int loadedIndex = _activeIndex;
+     if (loadedIndex == -1) {
+diff --git a/modules/fitsfilereader/CMakeLists.txt b/modules/fitsfilereader/CMakeLists.txt
+index 8b5c6cbbf5..578a8265a5 100644
+--- a/modules/fitsfilereader/CMakeLists.txt
++++ b/modules/fitsfilereader/CMakeLists.txt
+@@ -63,6 +63,9 @@ if (MSVC)
+   target_compile_options(CCfits PRIVATE "/W0")
+   target_compile_definitions(CCfits PRIVATE "_SCL_SECURE_NO_WARNINGS")
+ else ()
++  if (APPLE)
++    target_compile_options(cfitsio PRIVATE "-Wno-implicit-function-declaration")
++  endif ()
+   target_compile_options(cfitsio PRIVATE "-w")
+   target_compile_options(CCfits PRIVATE "-w")
+ endif ()
+diff --git a/modules/gaia/rendering/renderablegaiastars.cpp b/modules/gaia/rendering/renderablegaiastars.cpp
+index 54373f7d88..9ea55e2c8a 100644
+--- a/modules/gaia/rendering/renderablegaiastars.cpp
++++ b/modules/gaia/rendering/renderablegaiastars.cpp
+@@ -96,7 +96,7 @@ namespace {
+         "filter. If 'Billboard_*' is chosen then the geometry shaders will generate "
+         "screen-faced billboards for all stars. For '*_SSBO' the data will be stored in "
+         "Shader Storage Buffer Objects while '*_VBO' uses Vertex Buffer Objects for the "
+-        "streaming.",
++        "streaming. OBS! SSBO won't work on Apple.",
+         openspace::properties::Property::Visibility::AdvancedUser
+     };
+ 
+@@ -527,6 +527,16 @@ RenderableGaiaStars::RenderableGaiaStars(const ghoul::Dictionary& dictionary)
+ 
+     if (p.shaderOption.has_value()) {
+         _shaderOption = codegen::map<gaia::ShaderOption>(*p.shaderOption);
++
++#ifdef __APPLE__
++        switch (_shaderOption) {
++            case gaia::ShaderOption::PointSSBO:
++            case gaia::ShaderOption::BillboardSSBO:
++            case gaia::ShaderOption::BillboardSSBONoFBO:
++                LWARNING("Shader option unsupported, changing to Point VBO");
++                _shaderOption = gaia::ShaderOption::PointVBO;
++        }
++#endif // __APPLE__
+     }
+     _shaderOption.onChange([this]() {
+         _buffersAreDirty = true;
+@@ -963,6 +973,7 @@ void RenderableGaiaStars::render(const RenderData& data, RendererTasks&) {
+         shaderOption == gaia::ShaderOption::PointSSBO ||
+         shaderOption == gaia::ShaderOption::BillboardSSBONoFBO)
+     {
++#ifndef __APPLE__
+         //------------------------ RENDER WITH SSBO ---------------------------
+         // Update SSBO Index array with accumulated stars in all chunks.
+         glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboIdx);
+@@ -1025,6 +1036,7 @@ void RenderableGaiaStars::render(const RenderData& data, RendererTasks&) {
+         }
+ 
+         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
++#endif // !__APPLE__
+     }
+     else {
+         //---------------------- RENDER WITH VBO -----------------------------
+@@ -1292,6 +1304,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+     if (_program->isDirty() || _shadersAreDirty) {
+         switch (shaderOption) {
+             case gaia::ShaderOption::PointSSBO: {
++#ifndef __APPLE__
+                 std::unique_ptr<ghoul::opengl::ProgramObject> program =
+                     ghoul::opengl::ProgramObject::Build(
+                         "GaiaStar",
+@@ -1351,6 +1364,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+                 if (!hasProperty(&_tmPointPixelWeightThreshold)) {
+                     addProperty(_tmPointPixelWeightThreshold);
+                 }
++    #endif // !__APPLE__
+                 break;
+             }
+             case gaia::ShaderOption::PointVBO: {
+@@ -1394,6 +1408,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+             }
+             case gaia::ShaderOption::BillboardSSBO:
+             case gaia::ShaderOption::BillboardSSBONoFBO: {
++    #ifndef __APPLE__
+                 std::unique_ptr<ghoul::opengl::ProgramObject> program;
+                 if (shaderOption == gaia::ShaderOption::BillboardSSBO) {
+                     program = ghoul::opengl::ProgramObject::Build(
+@@ -1474,6 +1489,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+                 if (hasProperty(&_tmPointPixelWeightThreshold)) {
+                     removeProperty(_tmPointPixelWeightThreshold);
+                 }
++    #endif // !__APPLE__
+                 break;
+             }
+             case gaia::ShaderOption::BillboardVBO: {
+@@ -1643,6 +1659,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+             shaderOption == gaia::ShaderOption::PointSSBO ||
+             shaderOption == gaia::ShaderOption::BillboardSSBONoFBO)
+         {
++#ifndef __APPLE__
+             _useVBO = false;
+ 
+             // Trigger a rebuild of buffer data from octree.
+@@ -1715,6 +1732,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+                 glNamedBufferData(_vboVel, 0, nullptr, GL_STREAM_DRAW);
+             }
+             glBindBuffer(GL_ARRAY_BUFFER, 0);
++#endif // !__APPLE__
+         }
+         else { // ------------------ RENDER WITH VBO -----------------------
+             _useVBO = true;
+@@ -1846,6 +1864,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+             glBindBuffer(GL_ARRAY_BUFFER, 0);
+             glBindVertexArray(0);
+ 
++#ifndef __APPLE__
+             // Deallocate SSBO buffers if they existed.
+             if (_ssboIdx != 0) {
+                 glBindBuffer(GL_SHADER_STORAGE_BUFFER, _ssboIdx);
+@@ -1856,6 +1875,7 @@ void RenderableGaiaStars::update(const UpdateData&) {
+                 glNamedBufferData(_ssboData, 0, nullptr, GL_STREAM_DRAW);
+             }
+             glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
++#endif //!__APPLE__
+         }
+ 
+         // Generate VAO and VBO for Quad.
+diff --git a/modules/globebrowsing/src/geojson/globegeometryfeature.cpp b/modules/globebrowsing/src/geojson/globegeometryfeature.cpp
+index dd59aab676..05e1107c0c 100644
+--- a/modules/globebrowsing/src/geojson/globegeometryfeature.cpp
++++ b/modules/globebrowsing/src/geojson/globegeometryfeature.cpp
+@@ -304,7 +304,11 @@ void GlobeGeometryFeature::render(const RenderData& renderData, int pass,
+ 
+     const glm::dmat4 projectionTransform = renderData.camera.projectionMatrix();
+ 
++#ifndef __APPLE__
+     glLineWidth(_properties.lineWidth() * extraRenderData.lineWidthScale);
++#else  // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+ 
+     for (const RenderFeature& r : _renderFeatures) {
+         if (r.isExtrusionFeature && !_properties.extrude()) {
+diff --git a/modules/globebrowsing/src/renderableglobe.cpp b/modules/globebrowsing/src/renderableglobe.cpp
+index 7ff9647814..76ab9b124b 100644
+--- a/modules/globebrowsing/src/renderableglobe.cpp
++++ b/modules/globebrowsing/src/renderableglobe.cpp
+@@ -377,23 +377,23 @@ const Chunk& findChunkNode(const Chunk& node, const Geodetic2& location) {
+     return *n;
+ }
+ 
+-#if defined(__linux__) && defined(__clang__)
++#if defined(__APPLE__) || (defined(__linux__) && defined(__clang__))
+ using ChunkTileVector = std::vector<std::pair<ChunkTile, const LayerRenderSettings*>>;
+-#else // ^^^^ __linux__ && __clang__ // !(__linux__ && __clang__) vvvv
++#else
+ using ChunkTileVector =
+     std::pmr::vector<std::pair<ChunkTile, const LayerRenderSettings*>>;
+-#endif // __linux__ && __clang__
++#endif
+ 
+ ChunkTileVector tilesAndSettingsUnsorted(const LayerGroup& layerGroup,
+                                          const TileIndex& tileIndex)
+ {
+     ZoneScoped;
+ 
+-#if (defined(__linux__) && defined(__clang__))
++#if defined(__APPLE__) || (defined(__linux__) && defined(__clang__))
+     ChunkTileVector tilesAndSettings;
+-#else // ^^^^ __linux__ && __clang__ // !(__linux__ && __clang__) vvvv
++#else
+     ChunkTileVector tilesAndSettings(&global::memoryManager->TemporaryMemory);
+-#endif // __linux__ && __clang__
++#endif
+     for (Layer* layer : layerGroup.activeLayers()) {
+         if (layer->tileProvider()) {
+             tilesAndSettings.emplace_back(
+diff --git a/modules/space/rendering/renderabletravelspeed.cpp b/modules/space/rendering/renderabletravelspeed.cpp
+index 185facf84d..76e91c09a3 100644
+--- a/modules/space/rendering/renderabletravelspeed.cpp
++++ b/modules/space/rendering/renderabletravelspeed.cpp
+@@ -319,7 +319,11 @@ void RenderableTravelSpeed::render(const RenderData& data, RendererTasks&) {
+     _shaderProgram->setUniform("lineColor", _lineColor);
+     _shaderProgram->setUniform("opacity", opacity());
+ 
++#ifndef __APPLE__
+     glLineWidth(_lineWidth);
++#else // ^^^^ __APPLE__ // !__APPLE__ vvvv
++    glLineWidth(1.f);
++#endif // __APPLE__
+     glBindVertexArray(_vao);
+     glDrawArrays(GL_LINE_STRIP, 0, 3);
+     glBindVertexArray(0);
+diff --git a/modules/webbrowser/src/cefhost.cpp b/modules/webbrowser/src/cefhost.cpp
+index accb22af85..4f5ffcb1de 100644
+--- a/modules/webbrowser/src/cefhost.cpp
++++ b/modules/webbrowser/src/cefhost.cpp
+@@ -33,6 +33,10 @@
+ #include <filesystem>
+ #include <string_view>
+ 
++#ifdef __APPLE__
++#include <include/wrapper/cef_library_loader.h>
++#endif // __APPLE__
++
+ #ifdef WIN32
+ #pragma warning(push)
+ #pragma warning(disable : 4100)
+@@ -68,7 +72,11 @@ CefHost::CefHost([[maybe_unused]] const std::string& helperLocation) {
+         std::filesystem::path(helperLocation).parent_path();
+     const std::filesystem::path cefcache = std::format("{}/cefcache", root);
+     CefString(&settings.root_cache_path).FromString(cefcache.string());
++
++#ifndef __APPLE__
++    // Apple will always look for helper in a fixed location
+     CefString(&settings.browser_subprocess_path).FromString(helperLocation);
++#endif // __APPLE__
+ 
+     settings.windowless_rendering_enabled = 1;
+ 
+@@ -81,6 +89,15 @@ CefHost::CefHost([[maybe_unused]] const std::string& helperLocation) {
+     // cf. https://github.com/chromiumembedded/cef/issues/3685
+     settings.chrome_runtime = 1;
+ 
++#ifdef __APPLE__
++    // Load the CEF framework library at runtime instead of linking directly as required
++    // by the macOS sandbox implementation
++    CefScopedLibraryLoader library_loader;
++    if (!library_loader.LoadInMain()) {
++        return;
++    }
++#endif // __APPLE__
++
+     const CefRefPtr<WebBrowserApp> app = CefRefPtr<WebBrowserApp>(new WebBrowserApp);
+ 
+     const CefMainArgs args;
+diff --git a/modules/webbrowser/src/webbrowserapp.cpp b/modules/webbrowser/src/webbrowserapp.cpp
+index 61d9bb50fa..3725d700df 100644
+--- a/modules/webbrowser/src/webbrowserapp.cpp
++++ b/modules/webbrowser/src/webbrowserapp.cpp
+@@ -47,6 +47,10 @@ void WebBrowserApp::OnBeforeCommandLineProcessing(const CefString&,
+     commandline->AppendSwitch("use-mock-keychain");
+     commandline->AppendSwitch("enable-begin-frame-scheduling");
+     commandline->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
++#ifdef __APPLE__
++    commandline->AppendSwitch("--disable-gpu-sandbox");
++    commandline->AppendSwitch("--no-sandbox");
++#endif // __APPLE__
+ }
+ 
+ } // namespace openspace
+diff --git a/modules/webbrowser/webbrowsermodule.cpp b/modules/webbrowser/webbrowsermodule.cpp
+index b5e01a1bc1..10fdb30bb8 100644
+--- a/modules/webbrowser/webbrowsermodule.cpp
++++ b/modules/webbrowser/webbrowsermodule.cpp
+@@ -73,9 +73,12 @@ namespace {
+     std::filesystem::path findHelperExecutable() {
+ #ifdef WIN32
+         constexpr std::string_view SubprocessPath = "OpenSpace_Helper.exe";
+-#else // ^^^^ WIN32 // !WIN32 vvvv
++#elif defined(__APPLE__)
++        constexpr std::string_view SubprocessPath =
++            "../Frameworks/OpenSpace Helper.app/Contents/MacOS/OpenSpace Helper";
++#else
+         constexpr std::string_view SubprocessPath = "OpenSpace_Helper";
+-#endif // WIN32
++#endif
+ 
+         const std::filesystem::path execLocation = absPath(std::format(
+             "${{BIN}}/{}", SubprocessPath
+@@ -242,7 +245,7 @@ bool WebBrowserModule::isEnabled() const {
+ }
+ 
+ bool WebBrowserModule::canUseAcceleratedRendering() {
+-// Linux doesn't have a problem with the rendering
++// Linux doesn't have a problem with the rendering, Apple doesn't support OpenGL 4.5
+ #ifdef WIN32
+     ghoul::systemcapabilities::Version acceleratedVersion = {
+         .major = 4, .minor = 5, .release = 0
+diff --git a/modules/webgui/cmake/nodejs_support.cmake b/modules/webgui/cmake/nodejs_support.cmake
+index 067d9bc3fb..407169f246 100644
+--- a/modules/webgui/cmake/nodejs_support.cmake
++++ b/modules/webgui/cmake/nodejs_support.cmake
+@@ -37,6 +37,16 @@ function(DownloadNodeJs version download_dir)
+       set(filename "${basename}.exe")
+       set(path "v${version}/win-x64/${filename}")
+     endif ()
++  elseif (APPLE)
++    if (CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
++      set(basename "node-v${version}-darwin-arm64")
++      set(filename "${basename}.tar.gz")
++      set(path "v${version}/${filename}")
++    else () # Default to x64
++      set(basename "node-v${version}-darwin-x64")
++      set(filename "${basename}.tar.gz")
++      set(path "v${version}/${filename}")
++    endif ()
+   elseif (UNIX)
+     if (CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+       set(basename "node-v${version}-linux-arm64")
+@@ -71,7 +81,15 @@ function(DownloadNodeJs version download_dir)
+   message(STATUS "URL: ${NODEJS_DOWNLOAD_URL}")
+ 
+   # Extract the binary distribution for unix
+-  if (UNIX)
++  if (APPLE)
++    # Apple uses tar.gz
++    message(STATUS "Extracting Node.js: ${NODEJS_DOWNLOAD_PATH} in ${download_dir}")
++    execute_process(
++      COMMAND tar xzf ${NODEJS_DOWNLOAD_PATH}
++      WORKING_DIRECTORY ${download_dir}
++    )
++  endif ()
++  if (UNIX AND NOT APPLE)
+     # Linux uses tar.xz
+     message(STATUS "Extracting Node.js: ${NODEJS_DOWNLOAD_PATH} in ${download_dir}")
+     execute_process(
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 9e5eb53592..08a996273a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -212,6 +212,17 @@ set(OPENSPACE_SOURCE
+   util/versionchecker.cpp
+ )
+ 
++if (APPLE)
++  set(OPENSPACE_SOURCE
++    ${OPENSPACE_SOURCE}
++    interaction/touchbar.mm
++  )
++  set_source_files_properties(
++    interaction/touchbar.mm
++    PROPERTIES SKIP_PRECOMPILE_HEADERS ON
++  )
++endif ()
++
+ set(OPENSPACE_HEADER
+   ${PROJECT_SOURCE_DIR}/include/openspace/json.h
+   ${PROJECT_SOURCE_DIR}/include/openspace/camera/camera.h
+@@ -412,6 +423,13 @@ set(OPENSPACE_HEADER
+   ${PROJECT_SOURCE_DIR}/include/openspace/util/histogram.h
+ )
+ 
++if (APPLE)
++  set(OPENSPACE_HEADER
++    ${OPENSPACE_HEADER}
++    ${PROJECT_SOURCE_DIR}/include/openspace/interaction/touchbar.h
++  )
++endif ()
++
+ set(OPENSPACE_SHADERS
+   ${PROJECT_SOURCE_DIR}/shaders/blending.glsl
+   ${PROJECT_SOURCE_DIR}/shaders/core/screenspace_fs.glsl
+@@ -548,6 +566,9 @@ configure_file(
+   @ONLY
+ )
+ 
++if (APPLE)
++  target_link_libraries(openspace-core INTERFACE external-system-apple)
++endif ()
+ if (WIN32)
+   target_link_libraries(openspace-core PUBLIC "pdh")
+ endif ()
+diff --git a/src/engine/openspaceengine.cpp b/src/engine/openspaceengine.cpp
+index 2d5c6458a2..dbb5507fe2 100644
+--- a/src/engine/openspaceengine.cpp
++++ b/src/engine/openspaceengine.cpp
+@@ -110,6 +110,10 @@
+ #include "Psapi.h"
+ #endif // WIN32
+ 
++#ifdef __APPLE__
++#include <openspace/interaction/touchbar.h>
++#endif // __APPLE__
++
+ #include "openspaceengine_lua.inl"
+ 
+ namespace {
+@@ -880,6 +884,10 @@ void OpenSpaceEngine::loadAssets() {
+         global::syncEngine->addSyncables(_scene->camera()->syncables());
+     }
+ 
++#ifdef __APPLE__
++    showTouchbar();
++#endif // APPLE
++
+     runGlobalCustomizationScripts();
+ 
+     _writeDocumentationTask = std::async(
+diff --git a/src/interaction/touchbar.mm b/src/interaction/touchbar.mm
+new file mode 100644
+index 0000000000..0c38333274
+--- /dev/null
++++ b/src/interaction/touchbar.mm
+@@ -0,0 +1,282 @@
++/*****************************************************************************************
++ *                                                                                       *
++ * OpenSpace                                                                             *
++ *                                                                                       *
++ * Copyright (c) 2014-2026                                                               *
++ *                                                                                       *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this  *
++ * software and associated documentation files (the "Software"), to deal in the Software *
++ * without restriction, including without limitation the rights to use, copy, modify,    *
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software, and to    *
++ * permit persons to whom the Software is furnished to do so, subject to the following   *
++ * conditions:                                                                           *
++ *                                                                                       *
++ * The above copyright notice and this permission notice shall be included in all copies *
++ * or substantial portions of the Software.                                              *
++ *                                                                                       *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,   *
++ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A         *
++ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT    *
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF  *
++ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE  *
++ * OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                                         *
++ ****************************************************************************************/
++
++#include <openspace/interaction/touchbar.h>
++
++#include <openspace/engine/globals.h>
++#include <openspace/engine/openspaceengine.h>
++#include <openspace/rendering/renderengine.h>
++#include <openspace/scene/scene.h>
++#include <openspace/scene/scenegraphnode.h>
++#include <openspace/scripting/scriptengine.h>
++#include <openspace/util/timemanager.h>
++#include <ghoul/format.h>
++
++using namespace openspace;
++
++// Apple uses 'defer' as named arguments in some functions, so unfortunately, we have to
++// undef our defer macro from ghoul/misc/defer.h
++#undef defer
++#import <AppKit/NSButton.h>
++#import <AppKit/NSCustomTouchBarItem.h>
++#import <AppKit/NSTouchBar.h>
++#import <AppKit/NSWindow.h>
++#import <Foundation/Foundation.h>
++
++static NSString* pauseResultId = @"com.openspaceproject.pause_resume";
++static NSString* hideGuiId = @"com.openspaceproject.hide_gui";
++static NSString* hideOnScreenTextId = @"com.openspaceproject.hide_onscreen";
++NSArray* focusIdentifiers;
++
++
++@interface TouchBarDelegate : NSObject <NSTouchBarDelegate>
++    - (NSTouchBar *)makeTouchBar;
++    - (NSTouchBarItem *)touchBar:(NSTouchBar *)touchBar
++        makeItemForIdentifier:(NSTouchBarItemIdentifier)identifier;
++    - (void)pauseResumeButtonAction:(id)sender;
++    - (void)focusObjectAction:(id)sender;
++    - (void)hideTextAction:(id)sender;
++    - (void)hideGuiAction:(id)sender;
++@end
++
++@implementation TouchBarDelegate
++    - (NSTouchBar *)makeTouchBar {
++        NSTouchBar* touchBar = [[NSTouchBar alloc] init];
++        touchBar.delegate = self;
++
++        touchBar.customizationIdentifier = @"com.openspaceproject.main_touch_bar";
++
++        NSArray* objs = [@[hideGuiId, hideOnScreenTextId,
++            NSTouchBarItemIdentifierFixedSpaceSmall, pauseResultId,
++            NSTouchBarItemIdentifierFlexibleSpace]
++            arrayByAddingObjectsFromArray: focusIdentifiers];
++
++        // Set the default ordering of items.
++        touchBar.defaultItemIdentifiers = objs;
++
++        touchBar.customizationAllowedItemIdentifiers = objs;
++        if ([focusIdentifiers count] > 0) {
++            touchBar.principalItemIdentifier = [focusIdentifiers firstObject];
++        }
++
++        return touchBar;
++    }
++
++    - (NSTouchBarItem *)touchBar:(NSTouchBar *)touchBar
++                        makeItemForIdentifier:(NSTouchBarItemIdentifier)identifier
++    {
++        // Remove the unused variable warning
++        (void)touchBar;
++
++        if ([identifier isEqualToString:pauseResultId]) {
++            NSButton* button = [NSButton
++                buttonWithTitle:NSLocalizedString(
++                    (global::timeManager->isPaused() ? @"Resume" : @"Pause"),
++                    @""
++                )
++                target:self action:@selector(pauseResumeButtonAction:)
++            ];
++
++            NSCustomTouchBarItem* touchBarItem = [
++                [NSCustomTouchBarItem alloc]
++                initWithIdentifier:pauseResultId
++            ];
++            touchBarItem.view = button;
++            touchBarItem.customizationLabel = NSLocalizedString(
++                @"Pauses / Resumes the in-game time",
++                @""
++            );
++
++            return [touchBarItem autorelease];
++        }
++
++        if ([identifier isEqualToString:hideOnScreenTextId]) {
++            NSButton* button = [NSButton
++                buttonWithTitle:@"Toggle Text"
++                target:self action:@selector(hideTextAction:)
++            ];
++
++            NSCustomTouchBarItem* touchBarItem = [
++                [NSCustomTouchBarItem alloc]
++                initWithIdentifier:hideOnScreenTextId
++            ];
++            touchBarItem.view = button;
++            touchBarItem.customizationLabel = NSLocalizedString(
++                @"Toogles on-screen text",
++                @""
++            );
++
++            return [touchBarItem autorelease];
++        }
++
++        if ([identifier isEqualToString:hideGuiId]) {
++            NSButton* button = [NSButton
++                buttonWithTitle:@"Toggle GUI"
++                target:self action:@selector(hideGuiAction:)
++            ];
++
++            NSCustomTouchBarItem* touchBarItem = [
++                [NSCustomTouchBarItem alloc]
++                initWithIdentifier:hideGuiId
++            ];
++            touchBarItem.view = button;
++            touchBarItem.customizationLabel = NSLocalizedString(
++                @"Toggles the main GUI",
++                @""
++            );
++
++            return [touchBarItem autorelease];
++        }
++
++        if ([focusIdentifiers containsObject:identifier]) {
++            NSButton* button = [NSButton
++                buttonWithTitle:identifier
++                target:self action:@selector(focusObjectAction:)
++            ];
++
++            NSCustomTouchBarItem* touchBarItem = [
++                [NSCustomTouchBarItem alloc]
++                initWithIdentifier:identifier
++            ];
++            touchBarItem.view = button;
++            touchBarItem.customizationLabel = NSLocalizedString(
++                identifier,
++                @""
++            );
++
++            return [touchBarItem autorelease];
++        }
++
++        return nil;
++    }
++
++    - (void)pauseResumeButtonAction:(id)sender {
++        // No sync or send because time settings are always synced and sent
++        // to the connected nodes and peers
++        global::scriptEngine->queueScript({
++            .code = "openspace.time.togglePause();",
++            .synchronized = scripting::ScriptEngine::ShouldBeSynchronized::No,
++            .sendToRemote = scripting::ScriptEngine::ShouldSendToRemote::No
++        });
++
++        NSButton* button = static_cast<NSButton*>(sender);
++        // This check is inverted since the togglePause script has not run yet
++        [button setTitle: global::timeManager->isPaused() ? @"Pause" : @"Resume"];
++    }
++
++    - (void)focusObjectAction:(id)sender {
++        NSButton* button = static_cast<NSButton*>(sender);
++
++        NSString* title = [button title];
++
++        std::string str = std::format(
++            "openspace.setPropertyValueSingle('{}', '{}');\
++             openspace.setPropertyValueSingle('{}', '');\
++             openspace.setPropertyValueSingle('{}', '');",
++             "NavigationHandler.OrbitalNavigator.Anchor", std::string([title UTF8String]),
++             "NavigationHandler.OrbitalNavigator.Aim",
++             "NavigationHandler.OrbitalNavigator.RetargetAnchor"
++        );
++        global::scriptEngine->queueScript({
++            .code = str,
++            .synchronized = scripting::ScriptEngine::ShouldBeSynchronized::Yes,
++            .sendToRemote = scripting::ScriptEngine::ShouldSendToRemote::Yes
++        });
++    }
++
++    - (void)hideTextAction:(id)sender {
++        // Remove unused variable warning
++        (void)sender;
++
++        global::scriptEngine->queueScript(
++            "local isEnabled = openspace.propertyValue('Dashboard.IsEnabled');\
++             openspace.setPropertyValueSingle('Dashboard.IsEnabled', not isEnabled);\
++             openspace.setPropertyValueSingle('RenderEngine.ShowLog', not isEnabled);\
++             openspace.setPropertyValueSingle('RenderEngine.ShowVersion', not isEnabled);\
++             openspace.setPropertyValueSingle('RenderEngine.ShowCamera', not isEnabled)"
++        );
++    }
++
++    - (void)hideGuiAction:(id)sender {
++        // Remove unused variable warning
++        (void)sender;
++        global::scriptEngine->queueScript({
++            .code = "local isEnabled = openspace.propertyValue('Modules.CefWebGui.Visible');\
++             openspace.setPropertyValueSingle('Modules.CefWebGui.Visible', not isEnabled);",
++            .synchronized = scripting::ScriptEngine::ShouldBeSynchronized::No,
++            .sendToRemote = scripting::ScriptEngine::ShouldSendToRemote::No
++        });
++    }
++@end
++
++namespace {
++    TouchBarDelegate* g_TouchBarDelegate = nullptr;
++} // namespace
++
++namespace openspace {
++
++void showTouchbar() {
++    if (g_TouchBarDelegate) {
++        [g_TouchBarDelegate dealloc];
++        [focusIdentifiers dealloc];
++    }
++    else {
++        g_TouchBarDelegate = [[TouchBarDelegate alloc] init];
++        [NSApplication sharedApplication].automaticCustomizeTouchBarMenuItemEnabled = YES;
++    }
++
++    std::vector<SceneGraphNode*> ns = global::renderEngine->scene()->allSceneGraphNodes();
++
++    std::sort(
++        ns.begin(),
++        ns.end(),
++        [](SceneGraphNode* lhs, SceneGraphNode* rhs) {
++            return lhs->guiName() < rhs->guiName();
++        }
++    );
++
++    NSMutableArray* ids = [[NSMutableArray alloc] init];
++    for (SceneGraphNode* n : ns) {
++        const std::vector<std::string>& tags = n->tags();
++        auto it = std::find(tags.begin(), tags.end(), "GUI.Interesting");
++        if (it != tags.end()) {
++            [ids addObject: [NSString stringWithCString:n->identifier().c_str()
++                                      encoding:[NSString defaultCStringEncoding]]];
++        }
++    }
++
++    focusIdentifiers = [ids copy];
++    [ids dealloc];
++
++    NSTouchBar* touchBar = [g_TouchBarDelegate makeTouchBar];
++
++    // Attach the touch bar to all windows
++    NSArray<NSWindow*>* windows = [NSApplication sharedApplication].windows;
++    for (int i = 0; i < static_cast<int>(windows.count); ++i) {
++        NSWindow* wnd = windows[i];
++        wnd.touchBar = touchBar;
++    }
++}
++
++} // namespace openspace
+diff --git a/src/scene/scene_lua.inl b/src/scene/scene_lua.inl
+index 9821ce7ee2..b0ff87034c 100644
+--- a/src/scene/scene_lua.inl
++++ b/src/scene/scene_lua.inl
+@@ -308,7 +308,9 @@ std::vector<openspace::properties::Property*> findMatchesInAllProperties(
+ 
+     std::mutex mutex;
+     std::for_each(
++#ifndef __APPLE__
+         std::execution::par_unseq,
++#endif // __APPLE__
+         properties.cbegin(),
+         properties.cend(),
+         [&](Property* prop) {
+@@ -356,7 +358,9 @@ std::vector<openspace::properties::PropertyOwner*> findMatchesInAllPropertyOwner
+ 
+     std::mutex mutex;
+     std::for_each(
++#ifndef __APPLE__
+         std::execution::par_unseq,
++#endif // __APPLE__
+         propertyOwners.cbegin(),
+         propertyOwners.cend(),
+         [&](PropertyOwner* propOwner) {
+diff --git a/support/cmake/common-compile-settings b/support/cmake/common-compile-settings
+index b3ceb0613b..f609e35792 160000
+--- a/support/cmake/common-compile-settings
++++ b/support/cmake/common-compile-settings
+@@ -1 +1 @@
+-Subproject commit b3ceb0613bcd1b7b2babc514dca56764708c9123
++Subproject commit f609e357929b983983c47e05d2d77052d9b88c32
