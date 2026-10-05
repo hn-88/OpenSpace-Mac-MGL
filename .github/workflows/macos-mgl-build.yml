@@ -2,10 +2,7 @@ name: macos-mgl-build
 
 on: 
   workflow_dispatch:      # allows manual trigger
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+  
 
 env:
   BUILD_TYPE: Release
