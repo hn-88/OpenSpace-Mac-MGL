@@ -1,0 +1,65 @@
+name: macos-mgl-build
+
+on: 
+  workflow_dispatch:      # allows manual trigger
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: macos-14 # Uses Apple Silicon runner (M1/M2)
+
+    steps:
+    - name: Checkout OpenSpace-Mac repository
+      uses: actions/checkout@v4
+      with:
+        path: OpenSpace-Mac-Repo
+    
+    - name: Get official OpenSpace code
+      run: |
+        git clone --recursive https://github.com/OpenSpace/OpenSpace.git OpenSpace
+        cd OpenSpace
+        git checkout master --recurse-submodules
+        mkdir build
+
+    - name: Merge OpenSpace-Mac into OpenSpace
+      run: |
+        # Copy the contents of the OpenSpace-Mac directory from our repo into the official OpenSpace repo
+        cp -Rv OpenSpace-Mac-Repo/OpenSpace-Mac/* OpenSpace/
+
+    - name: Install dependencies
+      timeout-minutes: 30
+      run: |
+        brew update
+        # Install necessary system dependencies for macOS build
+        brew install glew boost freeimage mpv vulkan-headers vulkan-loader brotli gdal qt@6
+        df -h
+
+    - name: Configure CMake
+      run: |
+        cd OpenSpace/build
+        
+        # Configure using vcpkg toolchain to resolve dependencies
+        # Also includes the Qt6 brew path and Homebrew prefix 
+        cmake -G Xcode \
+              -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+              -Wno-dev \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DCMAKE_CXX_STANDARD=20 \
+              -DONLY_ACTIVE_ARCH=YES \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DCMAKE_CXX_FLAGS="-Wno-error -D_FILE_OFFSET_BITS=64" \
+              -DCMAKE_C_FLAGS="-Wno-error -D_FILE_OFFSET_BITS=64" \
+              -DCMAKE_BUILD_TYPE="Release" \
+              -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);/opt/homebrew" ..
+
+    - name: Build OpenSpace
+      run: |
+        cd OpenSpace/build
+        cmake --build . --config Release --parallel $(sysctl -n hw.ncpu)
