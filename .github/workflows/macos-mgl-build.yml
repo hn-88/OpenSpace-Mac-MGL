@@ -37,6 +37,10 @@ jobs:
         ./vcpkg/bootstrap-vcpkg.sh
         df -h
 
+    - name: Install dependencies
+      run: |
+        brew install autoconf autoconf-archive automake libtool
+
     - name: Configure CMake
       run: |
         cd OpenSpace/build
