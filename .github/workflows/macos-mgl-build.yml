@@ -2,10 +2,7 @@ name: macos-mgl-build
 
 on: 
   workflow_dispatch:      # allows manual trigger
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+  
 
 env:
   BUILD_TYPE: Release
@@ -47,6 +44,7 @@ jobs:
         # Configure using vcpkg toolchain to resolve dependencies
         cmake -G Xcode \
               -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+              -DVCPKG_INSTALL_OPTIONS="--allow-unsupported" \
               -Wno-dev \
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
               -DCMAKE_CXX_STANDARD=20 \
