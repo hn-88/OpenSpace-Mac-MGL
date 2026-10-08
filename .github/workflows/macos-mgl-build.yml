@@ -31,7 +31,7 @@ jobs:
     - name: Merge OpenSpace-Mac into OpenSpace
       run: |
         # Copy the contents of the OpenSpace-Mac directory from our repo into the official OpenSpace repo
-        cp -Rv OpenSpace-Mac-Repo/OpenSpace-Mac/* OpenSpace/
+        cp -Rv OpenSpace-Mac-Repo/* OpenSpace/
 
     - name: Install and Bootstrap vcpkg
       timeout-minutes: 30
