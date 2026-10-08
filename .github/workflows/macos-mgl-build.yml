@@ -2,14 +2,18 @@ name: macos-mgl-build
 
 on: 
   workflow_dispatch:      # allows manual trigger
-  
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
 
 env:
   BUILD_TYPE: Release
+  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
 jobs:
   build:
-    runs-on: macos-14 # Uses Apple Silicon runner (M1/M2)
+    runs-on: macos-14
 
     steps:
     - name: Checkout OpenSpace-Mac repository
@@ -19,14 +23,15 @@ jobs:
     
     - name: Get official OpenSpace code
       run: |
-        git clone https://github.com/OpenSpace/OpenSpace.git OpenSpace
+        git clone --recursive https://github.com/OpenSpace/OpenSpace.git OpenSpace
         cd OpenSpace
+        git checkout master --recurse-submodules
         mkdir build
 
     - name: Merge OpenSpace-Mac into OpenSpace
       run: |
         # Copy the contents of the OpenSpace-Mac directory from our repo into the official OpenSpace repo
-        cp -Rv OpenSpace-Mac-Repo/* OpenSpace/
+        cp -Rv OpenSpace-Mac-Repo/OpenSpace-Mac/* OpenSpace/
 
     - name: Install and Bootstrap vcpkg
       timeout-minutes: 30
@@ -41,7 +46,7 @@ jobs:
         
         # Configure using vcpkg toolchain to resolve dependencies
         cmake -G Xcode \
-              -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+              -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
               -Wno-dev \
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
               -DCMAKE_CXX_STANDARD=20 \
@@ -50,7 +55,8 @@ jobs:
               -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
               -DCMAKE_CXX_FLAGS="-Wno-error -D_FILE_OFFSET_BITS=64" \
               -DCMAKE_C_FLAGS="-Wno-error -D_FILE_OFFSET_BITS=64" \
-              -DCMAKE_BUILD_TYPE="Release"  ..
+              -DCMAKE_BUILD_TYPE="Release" \
+              -DCMAKE_PREFIX_PATH="/opt/homebrew" ..
 
     - name: Build OpenSpace
       run: |
